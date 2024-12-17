@@ -3,26 +3,61 @@ import sqlite3
 import time
 from datetime import datetime
 import threading
-
-# Serial Port Settings
-serial_port = 'COM12'  # Update this based on your HC06 Bluetooth COM port
-baud_rate = 9600
+import serial.tools.list_ports
+import os
 
 # SQLite Database Path
-db_path = 'D:\\Joee\\T3\\SensorsReadings.db'
+db_path = os.path.expanduser('~/SensorsReadings.db')  # Default to user's home directory
 
-# Open Serial Connection
-try:
-    ser = serial.Serial(serial_port, baud_rate)
-    time.sleep(2)  # Wait for connection to establish
-    print("Bluetooth connected successfully.")
-except serial.SerialException as e:
-    print(f"Error connecting to Bluetooth: {e}")
-    exit()
+# Baud Rate for HC-06 Bluetooth
+baud_rate = 9600
 
-# Data batch handling
+# Serial connection variables
+ser = None
 readings_batch = []
-batch_size = 1  # Adjust batch size for testing or real-time operation
+batch_size = 1  # Adjust batch size for real-time or testing
+last_data_time = time.time()
+
+
+def ensure_db_directory_exists():
+    """Ensure the directory for the database file exists."""
+    db_dir = os.path.dirname(db_path)
+    if db_dir and not os.path.exists(db_dir):
+        os.makedirs(db_dir)
+        print(f"Created directory for database: {db_dir}")
+
+
+def list_serial_ports():
+    """List all available serial ports on the system."""
+    ports = serial.tools.list_ports.comports()
+    return [port.device for port in ports]
+
+
+def open_serial_connection(max_attempts=5):
+    """
+    Scan and connect to an available Bluetooth serial port.
+    Retry multiple attempts for each port.
+    """
+    global ser
+    ports = list_serial_ports()
+    if not ports:
+        print("No serial ports detected. Please check the Bluetooth device connection.")
+        return None
+
+    for port in ports:
+        for attempt in range(1, max_attempts + 1):
+            try:
+                print(f"Attempting to connect to {port} (Attempt {attempt}/{max_attempts})...")
+                ser = serial.Serial(port, baud_rate, timeout=1)
+                time.sleep(2)  # Allow time for connection
+                print(f"Bluetooth connected successfully on {port}.")
+                return ser
+            except serial.SerialException as e:
+                print(f"Failed to connect to {port}: {e}")
+            time.sleep(1)  # Wait before retrying
+    print("Failed to establish a Bluetooth connection on any port.")
+    return None
+
 
 def create_table(cursor):
     """Create the sensor readings table if it doesn't exist."""
@@ -42,17 +77,17 @@ def create_table(cursor):
     ''')
     print("Table created or verified successfully.")
 
+
 def process_data(line, cursor, conn):
     """Process the incoming data and add it to the SQLite database in batches."""
-    global readings_batch
+    global readings_batch, last_data_time
     data = line.split(',')
 
-    # Print the raw data received for debugging
-    print(f"Raw data received: {repr(line)}")
+    print(f"Raw data received: {repr(line)}")  # Print raw data for debugging
 
-    if len(data) == 9:  # Expecting 9 values based on the updated Arduino code
+    if len(data) == 9:  # Expecting 9 values
         try:
-            # Extract real-time sensor readings
+            # Extract sensor readings
             timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             temperature = float(data[0])
             humidity = float(data[1])
@@ -64,56 +99,91 @@ def process_data(line, cursor, conn):
             mean_aqi = float(data[7])
             std_dev_aqi = float(data[8])
 
-            # Add the reading to the batch
+            # Add reading to batch
             readings_batch.append((timestamp, temperature, humidity, co_level, heat_index, air_quality_index,
                                    mean_heat_index, std_dev_heat_index, mean_aqi, std_dev_aqi))
 
-            # If the batch reaches the required size, insert into the database
+            # Update the last data time
+            last_data_time = time.time()
+
+            # Insert data into the database once batch is ready
             if len(readings_batch) >= batch_size:
                 try:
                     cursor.executemany('''
                         INSERT INTO sensor_readings (
-                            real_time, temperature, humidity, co_level, heat_index, 
-                            air_quality_index, mean_heat_index, std_dev_heat_index, 
+                            real_time, temperature, humidity, co_level, heat_index,
+                            air_quality_index, mean_heat_index, std_dev_heat_index,
                             mean_aqi, std_dev_aqi
                         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ''', readings_batch)
                     conn.commit()
                     print("Data committed to the database.")
-                    
-                    # Confirm insertion by querying the last entry
+
+                    # Print the last inserted entry for confirmation
                     cursor.execute("SELECT * FROM sensor_readings ORDER BY rowid DESC LIMIT 1")
                     last_entry = cursor.fetchone()
                     print("Last entry in the database:", last_entry)
 
-                    readings_batch.clear()  # Clear the batch after committing
+                    readings_batch.clear()  # Clear batch after committing
                 except sqlite3.Error as e:
-                    print(f"Error inserting data into database: {e}")
-
+                    print(f"Database insertion error: {e}")
         except ValueError as e:
-            print(f"Error in processing data: {e}")
+            print(f"Data processing error: {e}")
+
+
+def reconnect_bluetooth():
+    """Attempt to reconnect to Bluetooth if the connection is lost."""
+    global ser
+    ser = None
+    while ser is None:
+        print("Reconnecting to Bluetooth...")
+        ser = open_serial_connection()
+        if ser:
+            print("Reconnected successfully.")
+        else:
+            print("Reconnection failed. Retrying in 2 seconds...")
+            time.sleep(2)
+
 
 def read_bluetooth():
     """Read data from the Bluetooth module continuously."""
+    global ser, last_data_time
+    ensure_db_directory_exists()
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
 
-    # Create the table if not exists
+    # Create the table if it doesn't exist
     create_table(cursor)
 
     try:
         while True:
-            if ser.in_waiting > 0:
-                line = ser.readline().decode('utf-8').strip()  # Read the line from Bluetooth
-                process_data(line, cursor, conn)
-    except Exception as e:
-        print(f"Error reading Bluetooth: {e}")
+            # Check for timeout (no data received for more than 10 seconds)
+            if time.time() - last_data_time > 10:
+                print("No data received for 10 seconds. Restarting connection...")
+                reconnect_bluetooth()
+
+            if ser is None or not ser.is_open:
+                reconnect_bluetooth()
+
+            try:
+                if ser.in_waiting > 0:
+                    line = ser.readline().decode('utf-8').strip()
+                    process_data(line, cursor, conn)
+            except (serial.SerialException, OSError) as e:
+                print(f"Bluetooth connection lost: {e}. Reconnecting...")
+                ser.close()  # Close the current connection before trying to reconnect
+                reconnect_bluetooth()
+    except KeyboardInterrupt:
+        print("Program interrupted by user.")
     finally:
         conn.close()
-        print("Database connection closed.")
+        if ser and ser.is_open:
+            ser.close()
+        print("Database and serial connections closed.")
+
 
 # Run the Bluetooth reading in a separate thread
-bluetooth_thread = threading.Thread(target=read_bluetooth)
+bluetooth_thread = threading.Thread(target=read_bluetooth, daemon=True)
 bluetooth_thread.start()
 
 # Keep the main thread alive
@@ -123,5 +193,6 @@ try:
 except KeyboardInterrupt:
     print("Program interrupted.")
 finally:
-    ser.close()
+    if ser and ser.is_open:
+        ser.close()
     print("Serial connection closed.")
